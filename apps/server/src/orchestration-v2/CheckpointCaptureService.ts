@@ -75,8 +75,15 @@ export const layer: Layer.Layer<
       readonly scopeId: CheckpointScopeId;
     }) {
       const context = yield* projections.getCheckpointCaptureContext(input.threadId, input);
-      const { run, rootNode, scope, providerThread, preservedCheckpointOrdinals, sideChat } =
-        context;
+      const {
+        run,
+        rootNode,
+        scope,
+        providerThread,
+        previousRunCheckpoint,
+        preservedCheckpointOrdinals,
+        sideChat,
+      } = context;
       // Runs settle before capture; `waiting` is a run persisted before captures ran after settling.
       const settled =
         run?.status === "completed" || run?.status === "interrupted" || run?.status === "cancelled";
@@ -107,7 +114,8 @@ export const layer: Layer.Layer<
       }
 
       const capturedAt = yield* DateTime.now;
-      const baselineOrdinalWithinScope = Math.max(0, run.ordinal - 1);
+      const baselineOrdinalWithinScope =
+        previousRunCheckpoint?.ordinalWithinScope ?? Math.max(0, run.ordinal - 1);
       const isPreserved = (ordinalWithinScope: number) =>
         preservedCheckpointOrdinals.includes(ordinalWithinScope);
       // The baselines this capture materializes are attributed to the run materializing them. The
@@ -148,6 +156,9 @@ export const layer: Layer.Layer<
           runId: run.id,
           nodeId: rootNode.id,
           ordinalWithinScope: run.ordinal,
+          ...(previousRunCheckpoint === undefined
+            ? {}
+            : { previousCheckpoint: previousRunCheckpoint }),
           appRunOrdinal: run.ordinal,
           capturedAt,
           forceMissing: sideChat,

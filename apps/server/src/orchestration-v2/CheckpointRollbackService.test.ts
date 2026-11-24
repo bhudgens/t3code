@@ -222,9 +222,16 @@ it.effect.each([
       },
       providerThread,
       providerSession: undefined,
-      checkpoint: { id: checkpointId, scopeId, status: "ready", appRunOrdinal: 0 },
+      checkpoint: {
+        id: checkpointId,
+        scopeId,
+        status: "ready",
+        appRunOrdinal: 0,
+        ordinalWithinScope: 0,
+      },
       scope: { id: scopeId, cwd: worktreePath },
       runsToRollback: [],
+      discardedSnapshotOrdinals: [],
       targetAttempt: undefined,
       rolledBackAttemptIds: [],
       staleCheckpoints: [],
@@ -446,9 +453,10 @@ it.effect.each([
           providerInstanceId,
         },
         providerSession: undefined,
-        checkpoint: { id: checkpointId, scopeId, status, appRunOrdinal: 0 },
+        checkpoint: { id: checkpointId, scopeId, status, appRunOrdinal: 0, ordinalWithinScope: 0 },
         scope: { id: scopeId, cwd: worktreePath },
         runsToRollback: [],
+        discardedSnapshotOrdinals: [],
         targetAttempt: undefined,
         rolledBackAttemptIds: [],
         staleCheckpoints: [],
@@ -541,7 +549,7 @@ it.effect.each([
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-const seedRollbackHistory = Effect.gen(function* () {
+const seedRollbackHistory = Effect.fn("seedRollbackHistory")(function* (insertedTurns = 0) {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
   const threadId = ThreadId.make("rollback-history");
@@ -559,6 +567,7 @@ const seedRollbackHistory = Effect.gen(function* () {
   const turnId = (ordinal: number) => ProviderTurnId.make(`rollback-history-turn-${ordinal}`);
   const checkpointId = (ordinal: number) =>
     CheckpointId.make(`rollback-history-checkpoint-${ordinal}`);
+  const appOrdinal = (ordinal: number) => (ordinal < 2 ? ordinal : ordinal + insertedTurns);
   type EventInput<Event = OrchestrationV2DomainEvent> = Event extends OrchestrationV2DomainEvent
     ? Omit<Event, "id" | "occurredAt" | "threadId">
     : never;
@@ -607,7 +616,7 @@ const seedRollbackHistory = Effect.gen(function* () {
     nativeConversationHeadRef: null,
     status: "idle" as const,
     firstRunOrdinal: 1,
-    lastRunOrdinal: 6,
+    lastRunOrdinal: appOrdinal(6),
     handoffIds: [],
     forkedFrom: null,
     createdAt: now,
@@ -648,7 +657,7 @@ const seedRollbackHistory = Effect.gen(function* () {
       payload: {
         id: runId(ordinal),
         threadId,
-        ordinal,
+        ordinal: appOrdinal(ordinal),
         providerInstanceId,
         modelSelection,
         providerThreadId,
@@ -744,7 +753,7 @@ const seedRollbackHistory = Effect.gen(function* () {
         nodeId: nodeId(Math.max(1, Math.min(ordinal, 7))),
         parentCheckpointId: null,
         ordinalWithinScope: ordinal,
-        appRunOrdinal: ordinal === 0 ? null : ordinal,
+        appRunOrdinal: ordinal === 0 ? null : appOrdinal(ordinal),
         ref: CheckpointRef.make(`refs/t3/rollback-history/${ordinal}`),
         status: ordinal === 7 ? "stale" : "ready",
         files: [],
@@ -882,7 +891,7 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
   (it) => {
     it.effect("rolls back later terminal runs despite obsolete unrelated SQLite payloads", () =>
       Effect.gen(function* () {
-        const history = yield* seedRollbackHistory;
+        const history = yield* seedRollbackHistory(2);
         const sql = yield* SqlClient.SqlClient;
         const { threadId, runId, nodeId, checkpointId } = history;
         yield* sql`
@@ -954,7 +963,7 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
 
     it.effect("rewinds the conversation to a run whose snapshot capture failed", () =>
       Effect.gen(function* () {
-        const history = yield* seedRollbackHistory;
+        const history = yield* seedRollbackHistory();
         const sql = yield* SqlClient.SqlClient;
         yield* sql`UPDATE orchestration_v2_projection_checkpoints
           SET status = 'error', payload_json = json_set(payload_json, '$.status', 'error')
@@ -971,7 +980,7 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
       "rewinds stopped runs repeatedly without counting discarded provider turns again",
       () =>
         Effect.gen(function* () {
-          const history = yield* seedRollbackHistory;
+          const history = yield* seedRollbackHistory();
           yield* history.rollback(5);
           yield* history.rollback(2);
           yield* history.rollback(0);
@@ -1003,7 +1012,7 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
 
     it.effect("skips a pending rollback once the thread is deleted", () =>
       Effect.gen(function* () {
-        const history = yield* seedRollbackHistory;
+        const history = yield* seedRollbackHistory();
         const thread = yield* history.store.getThread(history.threadId);
         yield* history.store.apply({
           id: EventId.make("rollback-history-deleted"),
