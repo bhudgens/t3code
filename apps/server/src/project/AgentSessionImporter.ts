@@ -848,18 +848,36 @@ const make = Effect.gen(function* () {
       );
       const boundary =
         boundaries.findLast(([, turn]) => turn.nativeHistoryReconciled) ?? boundaries[0];
-      if (boundary === undefined) return null;
-      const [anchor, anchorTurn] = boundary;
-      const run = activeRunByAttempt.get(anchorTurn.runAttemptId!)!;
+      let importedBoundary: { readonly text: string; readonly createdAt: string } | null = null;
+      if (boundary === undefined) {
+        if (thread.historyOrigin !== "v1_import" || runs.length > 0 || ownedTurns.length > 0) {
+          return null;
+        }
+        const { turnItems } = yield* orchestrator.getThreadRecords(threadId, ["turnItems"], {
+          turnItemTypes: ["user_message", "assistant_message"],
+        });
+        const last = turnItems.at(-1);
+        if (
+          last?.type !== "assistant_message" ||
+          last.runId !== null ||
+          last.completedAt === null
+        ) {
+          return null;
+        }
+        importedBoundary = { text: last.text, createdAt: DateTime.formatIso(last.completedAt) };
+      }
+      const [anchor, anchorTurn] = boundary ?? [];
+      const run =
+        anchorTurn === undefined ? undefined : activeRunByAttempt.get(anchorTurn.runAttemptId!);
       const runsById = new Map(runs.map((run) => [run.id, run]));
       const runsByAttempt = new Map(activeRunByAttempt);
       for (const attempt of attempts) {
         const run = runsById.get(attempt.runId);
         if (run !== undefined && run.status !== "rolled_back") runsByAttempt.set(attempt.id, run);
       }
-      let anchorRunOrdinal = run.ordinal;
+      let anchorRunOrdinal = run?.ordinal ?? 0;
       for (const turn of knownTurns.values()) {
-        if (turn.ordinal > anchorTurn.ordinal || turn.runAttemptId === null) continue;
+        if (turn.ordinal > (anchorTurn?.ordinal ?? 0) || turn.runAttemptId === null) continue;
         const preceding = runsByAttempt.get(turn.runAttemptId);
         if (preceding !== undefined)
           anchorRunOrdinal = Math.max(anchorRunOrdinal, preceding.ordinal);
@@ -870,9 +888,10 @@ const make = Effect.gen(function* () {
         owner,
         nativeId,
         anchor,
+        importedBoundary,
         anchorRunOrdinal,
-        anchorTurnOrdinal: anchorTurn.ordinal,
-        modelSelection: run.modelSelection,
+        anchorTurnOrdinal: anchorTurn?.ordinal ?? 0,
+        modelSelection: run?.modelSelection ?? thread.modelSelection,
         runs,
         ownedTurns,
         knownTurns,
@@ -882,201 +901,268 @@ const make = Effect.gen(function* () {
     },
   );
 
+  type CodexRefreshTarget = NonNullable<Effect.Success<ReturnType<typeof readCodexRefreshTarget>>>;
+  const hasPendingHistoryMutation = (threadId: ThreadId) =>
+    outbox.hasUnsettled(threadId, ["provider-thread.rollback", "checkpoint.capture"]);
+
+  const readCodexHistory = Effect.fn("AgentSessionImporter.readCodexHistory")(function* (
+    threadId: ThreadId,
+    target: CodexRefreshTarget,
+  ) {
+    if (yield* hasPendingHistoryMutation(threadId)) return null;
+    const project = yield* projects.getById(target.thread.projectId);
+    if (Option.isNone(project)) return null;
+    const cwd = target.thread.worktreePath ?? project.value.workspaceRoot;
+    const adapter = yield* registry.get(target.owner.providerInstanceId);
+    const providerSessionId = yield* idAllocator.allocate.providerSession({
+      providerInstanceId: target.owner.providerInstanceId,
+      threadId,
+    });
+    return yield* adapter
+      .openSession({
+        threadId,
+        providerSessionId,
+        modelSelection: target.modelSelection,
+        runtimePolicy: {
+          runtimeMode: target.thread.runtimeMode,
+          interactionMode: target.thread.interactionMode,
+          cwd,
+        },
+        initialNativeThreadId: target.nativeId,
+      })
+      .pipe(
+        Effect.flatMap(
+          Effect.fnUntraced(function* (session) {
+            if (session.readHistoryAfter === undefined) return null;
+            const anchor =
+              target.importedBoundary === null
+                ? target.anchor
+                : yield* (
+                    session.resolveImportedHistoryAnchor?.({
+                      providerThread: target.owner,
+                      boundary: target.importedBoundary,
+                    }) ?? Effect.succeed(null)
+                  );
+            if (anchor == null) return null;
+            const history = yield* session.readHistoryAfter({
+              providerThread: target.owner,
+              nativeTurnId: anchor,
+              knownNativeTurnIds: new Set(target.knownTurns.keys()),
+            });
+            return { anchor, history };
+          }),
+        ),
+        Effect.scoped,
+        codexReaders.withPermit,
+        Effect.timeout(CODEX_HISTORY_READ_TIMEOUT),
+      );
+  });
+
+  const appendCodexHistory = Effect.fn("AgentSessionImporter.appendCodexHistory")(function* (
+    threadId: ThreadId,
+    target: CodexRefreshTarget,
+    { anchor, history }: NonNullable<Effect.Success<ReturnType<typeof readCodexHistory>>>,
+  ) {
+    const settled = [];
+    const preceding = new Map<string, { run: number; turn: number }>();
+    let lastRun = target.anchorRunOrdinal;
+    let lastTurn = target.anchorTurnOrdinal;
+    for (const nativeTurn of history) {
+      if (nativeTurn.status === "inProgress") break;
+      settled.push(nativeTurn);
+      const known = target.knownTurns.get(nativeTurn.id);
+      if (known === undefined) {
+        preceding.set(nativeTurn.id, { run: lastRun, turn: lastTurn });
+        continue;
+      }
+      const run =
+        known.runAttemptId === null ? undefined : target.runsByAttempt.get(known.runAttemptId);
+      lastTurn = Math.max(lastTurn, known.ordinal);
+      if (run !== undefined) lastRun = Math.max(lastRun, run.ordinal);
+    }
+    const additions = [];
+    let beforeRun = (target.runs.at(-1)?.ordinal ?? 0) + 1;
+    let beforeTurn = (target.ownedTurns.at(-1)?.ordinal ?? 0) + 1;
+    let boundary: OrchestrationV2ProviderTurn | undefined;
+    const seen = new Set([anchor]);
+    for (const nativeTurn of settled.reverse()) {
+      if (seen.has(nativeTurn.id)) return 0;
+      seen.add(nativeTurn.id);
+      const known = target.knownTurns.get(nativeTurn.id);
+      if (known !== undefined) {
+        beforeTurn = Math.min(beforeTurn, known.ordinal);
+        const attemptId = known.runAttemptId;
+        if (attemptId !== null) {
+          beforeRun = Math.min(
+            beforeRun,
+            target.runsByAttempt.get(attemptId)?.ordinal ?? beforeRun,
+          );
+          if (target.activeRunByAttempt.has(attemptId)) boundary ??= known;
+        }
+        continue;
+      }
+      if (nativeTurn.status !== "completed" || nativeTurn.id === "") continue;
+      const indexOfUserMessage = nativeTurn.messages.findIndex(
+        (message) => message.role === "user",
+      );
+      if (indexOfUserMessage < 0) continue;
+      // A held run can execute after a later submission, leaving no ordered slot for a gap.
+      const after = preceding.get(nativeTurn.id)!;
+      if (beforeRun <= after.run || beforeTurn <= after.turn) return 0;
+      additions.push({ nativeTurn, indexOfUserMessage, beforeRun, beforeTurn });
+    }
+    additions.reverse();
+    const movedRuns = shiftedOrdinals(
+      target.runs.map((run) => run.ordinal),
+      additions.map((turn) => turn.beforeRun),
+    );
+    const movedTurns = shiftedOrdinals(
+      target.ownedTurns.map((turn) => turn.ordinal),
+      additions.map((turn) => turn.beforeTurn),
+    );
+    const events: Array<OrchestrationV2DomainEvent> = [];
+    const occurredAt = yield* DateTime.now;
+    // Move the suffix back to front to free the unique ordinals before inserting into them.
+    for (const run of target.runs.toReversed()) {
+      const ordinal = movedRuns.get(run.ordinal);
+      if (ordinal === undefined) continue;
+      events.push({
+        id: yield* idAllocator.allocate.event({ threadId }),
+        type: "run.updated",
+        threadId,
+        occurredAt,
+        payload: { ...run, ordinal },
+      });
+    }
+    for (const turn of target.ownedTurns.toReversed()) {
+      const ordinal = movedTurns.get(turn.ordinal);
+      const markBoundary = turn.id === boundary?.id && !turn.nativeHistoryReconciled;
+      if (ordinal === undefined && !markBoundary) continue;
+      events.push({
+        id: yield* idAllocator.allocate.event({ threadId }),
+        type: "provider-turn.updated",
+        threadId,
+        driver: target.owner.driver,
+        occurredAt,
+        payload: {
+          ...turn,
+          ordinal: ordinal ?? turn.ordinal,
+          ...(markBoundary ? { nativeHistoryReconciled: true } : {}),
+        },
+      });
+    }
+    if (movedRuns.size > 0) {
+      const { checkpoints } = yield* orchestrator.getThreadRecords(threadId, ["checkpoints"]);
+      for (const providerThread of target.providerThreads) {
+        const first = providerThread.firstRunOrdinal;
+        const last = providerThread.lastRunOrdinal;
+        const firstRunOrdinal = first === null ? null : (movedRuns.get(first) ?? first);
+        const lastRunOrdinal = last === null ? null : (movedRuns.get(last) ?? last);
+        if (firstRunOrdinal === first && lastRunOrdinal === last) continue;
+        events.push({
+          id: yield* idAllocator.allocate.event({ threadId }),
+          type: "provider-thread.updated",
+          threadId,
+          occurredAt,
+          payload: { ...providerThread, firstRunOrdinal, lastRunOrdinal },
+        });
+      }
+      for (const checkpoint of checkpoints) {
+        if (checkpoint.appRunOrdinal === null) continue;
+        const appRunOrdinal = movedRuns.get(checkpoint.appRunOrdinal);
+        if (appRunOrdinal === undefined) continue;
+        events.push({
+          id: yield* idAllocator.allocate.event({ threadId }),
+          type: "checkpoint.captured",
+          threadId,
+          occurredAt,
+          payload: { ...checkpoint, appRunOrdinal },
+        });
+      }
+    }
+    for (const [
+      index,
+      { nativeTurn, indexOfUserMessage, beforeRun, beforeTurn },
+    ] of additions.entries()) {
+      events.push(
+        ...externalTurnEvents({
+          thread: target.thread,
+          owner: target.owner,
+          nativeThreadId: target.nativeId,
+          nativeTurn,
+          indexOfUserMessage,
+          runOrdinal: beforeRun + index,
+          turnOrdinal: beforeTurn + index,
+          ids: idAllocator.derive,
+        }),
+      );
+    }
+    if (events.length === 0) return 0;
+    const stored = yield* eventSink.write({
+      unlessNativeThreadOwned: target.owner,
+      repositionRunItems: movedRuns.size > 0,
+      events,
+    });
+    return stored.length === 0 ? 0 : additions.length;
+  });
+
+  const importedReads = new Set<ThreadId>();
   const refreshCodexHistory = Effect.fn("AgentSessionImporter.refreshCodexHistory")(
     function* ({ threadId }: { readonly threadId: ThreadId }) {
       const target = yield* readCodexRefreshTarget(threadId);
       if (target === null) return 0;
-      if (
-        yield* outbox.hasUnsettled(threadId, ["provider-thread.rollback", "checkpoint.capture"])
-      ) {
-        return 0;
-      }
-      const project = yield* projects.getById(target.thread.projectId);
-      if (Option.isNone(project)) return 0;
-      const cwd = target.thread.worktreePath ?? project.value.workspaceRoot;
-      const adapter = yield* registry.get(target.owner.providerInstanceId);
-      const providerSessionId = yield* idAllocator.allocate.providerSession({
-        providerInstanceId: target.owner.providerInstanceId,
-        threadId,
-      });
-      const history = yield* adapter
-        .openSession({
+      const boundary = target.importedBoundary;
+      if (boundary === null) {
+        // Preserve ordinal allocation for a thread already used in T3.
+        return yield* threadCommands.withLock(
           threadId,
-          providerSessionId,
-          modelSelection: target.modelSelection,
-          runtimePolicy: {
-            runtimeMode: target.thread.runtimeMode,
-            interactionMode: target.thread.interactionMode,
-            cwd,
-          },
-          initialNativeThreadId: target.nativeId,
-        })
-        .pipe(
-          Effect.flatMap(
-            (session) =>
-              session.readHistoryAfter?.({
-                providerThread: target.owner,
-                nativeTurnId: target.anchor,
-                knownNativeTurnIds: new Set(target.knownTurns.keys()),
-              }) ?? Effect.succeed([]),
-          ),
-          Effect.scoped,
-          codexReaders.withPermit,
-          Effect.timeout(CODEX_HISTORY_READ_TIMEOUT),
-        );
-      const settled = [];
-      const preceding = new Map<string, { run: number; turn: number }>();
-      let lastRun = target.anchorRunOrdinal;
-      let lastTurn = target.anchorTurnOrdinal;
-      for (const nativeTurn of history) {
-        if (nativeTurn.status === "inProgress") break;
-        settled.push(nativeTurn);
-        const known = target.knownTurns.get(nativeTurn.id);
-        if (known === undefined) {
-          preceding.set(nativeTurn.id, { run: lastRun, turn: lastTurn });
-          continue;
-        }
-        const run =
-          known.runAttemptId === null ? undefined : target.runsByAttempt.get(known.runAttemptId);
-        lastTurn = Math.max(lastTurn, known.ordinal);
-        if (run !== undefined) lastRun = Math.max(lastRun, run.ordinal);
-      }
-      const additions = [];
-      let beforeRun = (target.runs.at(-1)?.ordinal ?? 0) + 1;
-      let beforeTurn = (target.ownedTurns.at(-1)?.ordinal ?? 0) + 1;
-      let boundary: OrchestrationV2ProviderTurn | undefined;
-      const seen = new Set([target.anchor]);
-      for (const nativeTurn of settled.reverse()) {
-        if (seen.has(nativeTurn.id)) return 0;
-        seen.add(nativeTurn.id);
-        const known = target.knownTurns.get(nativeTurn.id);
-        if (known !== undefined) {
-          beforeTurn = Math.min(beforeTurn, known.ordinal);
-          const attemptId = known.runAttemptId;
-          if (attemptId !== null) {
-            beforeRun = Math.min(
-              beforeRun,
-              target.runsByAttempt.get(attemptId)?.ordinal ?? beforeRun,
-            );
-            if (target.activeRunByAttempt.has(attemptId)) boundary ??= known;
-          }
-          continue;
-        }
-        if (nativeTurn.status !== "completed" || nativeTurn.id === "") continue;
-        const indexOfUserMessage = nativeTurn.messages.findIndex(
-          (message) => message.role === "user",
-        );
-        if (indexOfUserMessage < 0) continue;
-        // A held run can execute after a later submission, leaving no ordered slot for a gap.
-        const after = preceding.get(nativeTurn.id)!;
-        if (beforeRun <= after.run || beforeTurn <= after.turn) return 0;
-        additions.push({ nativeTurn, indexOfUserMessage, beforeRun, beforeTurn });
-      }
-      additions.reverse();
-      const movedRuns = shiftedOrdinals(
-        target.runs.map((run) => run.ordinal),
-        additions.map((turn) => turn.beforeRun),
-      );
-      const movedTurns = shiftedOrdinals(
-        target.ownedTurns.map((turn) => turn.ordinal),
-        additions.map((turn) => turn.beforeTurn),
-      );
-      const events: Array<OrchestrationV2DomainEvent> = [];
-      const occurredAt = yield* DateTime.now;
-      // Move the suffix back to front to free the unique ordinals before inserting into them.
-      for (const run of target.runs.toReversed()) {
-        const ordinal = movedRuns.get(run.ordinal);
-        if (ordinal === undefined) continue;
-        events.push({
-          id: yield* idAllocator.allocate.event({ threadId }),
-          type: "run.updated",
-          threadId,
-          occurredAt,
-          payload: { ...run, ordinal },
-        });
-      }
-      for (const turn of target.ownedTurns.toReversed()) {
-        const ordinal = movedTurns.get(turn.ordinal);
-        const markBoundary = turn.id === boundary?.id && !turn.nativeHistoryReconciled;
-        if (ordinal === undefined && !markBoundary) continue;
-        events.push({
-          id: yield* idAllocator.allocate.event({ threadId }),
-          type: "provider-turn.updated",
-          threadId,
-          driver: target.owner.driver,
-          occurredAt,
-          payload: {
-            ...turn,
-            ordinal: ordinal ?? turn.ordinal,
-            ...(markBoundary ? { nativeHistoryReconciled: true } : {}),
-          },
-        });
-      }
-      if (movedRuns.size > 0) {
-        const { checkpoints } = yield* orchestrator.getThreadRecords(threadId, ["checkpoints"]);
-        for (const providerThread of target.providerThreads) {
-          const first = providerThread.firstRunOrdinal;
-          const last = providerThread.lastRunOrdinal;
-          const firstRunOrdinal = first === null ? null : (movedRuns.get(first) ?? first);
-          const lastRunOrdinal = last === null ? null : (movedRuns.get(last) ?? last);
-          if (firstRunOrdinal === first && lastRunOrdinal === last) continue;
-          events.push({
-            id: yield* idAllocator.allocate.event({ threadId }),
-            type: "provider-thread.updated",
-            threadId,
-            occurredAt,
-            payload: { ...providerThread, firstRunOrdinal, lastRunOrdinal },
-          });
-        }
-        for (const checkpoint of checkpoints) {
-          if (checkpoint.appRunOrdinal === null) continue;
-          const appRunOrdinal = movedRuns.get(checkpoint.appRunOrdinal);
-          if (appRunOrdinal === undefined) continue;
-          events.push({
-            id: yield* idAllocator.allocate.event({ threadId }),
-            type: "checkpoint.captured",
-            threadId,
-            occurredAt,
-            payload: { ...checkpoint, appRunOrdinal },
-          });
-        }
-      }
-      for (const [
-        index,
-        { nativeTurn, indexOfUserMessage, beforeRun, beforeTurn },
-      ] of additions.entries()) {
-        events.push(
-          ...externalTurnEvents({
-            thread: target.thread,
-            owner: target.owner,
-            nativeThreadId: target.nativeId,
-            nativeTurn,
-            indexOfUserMessage,
-            runOrdinal: beforeRun + index,
-            turnOrdinal: beforeTurn + index,
-            ids: idAllocator.derive,
+          Effect.gen(function* () {
+            const current = yield* readCodexRefreshTarget(threadId);
+            if (current === null || current.importedBoundary !== null) return 0;
+            const history = yield* readCodexHistory(threadId, current);
+            return history === null ? 0 : yield* appendCodexHistory(threadId, current, history);
           }),
         );
       }
-      if (events.length === 0) return 0;
-      const stored = yield* eventSink.write({
-        unlessNativeThreadOwned: target.owner,
-        repositionRunItems: movedRuns.size > 0,
-        events,
-      });
-      return stored.length === 0 ? 0 : additions.length;
+
+      if (importedReads.has(threadId)) return 0;
+      importedReads.add(threadId);
+      return yield* Effect.gen(function* () {
+        const history = yield* readCodexHistory(threadId, target);
+        if (history === null || history.history.length === 0) return 0;
+        return yield* threadCommands.withLock(
+          threadId,
+          Effect.gen(function* () {
+            const current = yield* readCodexRefreshTarget(threadId);
+            if (
+              current === null ||
+              current.owner.id !== target.owner.id ||
+              current.nativeId !== target.nativeId ||
+              current.importedBoundary?.createdAt !== boundary.createdAt ||
+              current.importedBoundary.text !== boundary.text ||
+              (yield* hasPendingHistoryMutation(threadId))
+            ) {
+              return 0;
+            }
+            return yield* appendCodexHistory(threadId, current, history);
+          }),
+        );
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            importedReads.delete(threadId);
+          }),
+        ),
+      );
     },
     (effect, { threadId }) =>
-      // A send after returning to the thread must take its ordinal after the sync.
-      threadCommands
-        .withLock(threadId, effect)
-        .pipe(
-          Effect.catch((cause) =>
-            Effect.logDebug("Could not refresh Codex history", { threadId, cause }).pipe(
-              Effect.as(0),
-            ),
+      effect.pipe(
+        Effect.catch((cause) =>
+          Effect.logDebug("Could not refresh Codex history", { threadId, cause }).pipe(
+            Effect.as(0),
           ),
         ),
+      ),
   );
 
   return { importRecentAgentThreads, importNativeHistory, refreshCodexHistory };

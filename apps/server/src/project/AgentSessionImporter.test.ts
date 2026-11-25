@@ -650,6 +650,82 @@ it.effect("appends new Codex messages to the existing import exactly once", () =
   }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
 
+it.effect("refreshes a capped Codex import and moves to native turn IDs without duplicates", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const source = candidate(CODEX_MODEL_SELECTION, "capped-codex-import");
+    const threadId = importId(source);
+    const historyRead = yield* Deferred.make<void>();
+    const releaseRead = yield* Deferred.make<void>();
+    const lock = yield* ThreadCommandExecutor.make;
+    const externalTime = DateTime.makeUnsafe("2026-09-02T10:00:00.000Z");
+    const reads: Array<string> = [];
+    const boundaries: Array<{ text: string; createdAt: string }> = [];
+    const session = {
+      resolveImportedHistoryAnchor: ({ boundary }) =>
+        Effect.sync(() => {
+          boundaries.push(boundary);
+          return "imported-turn";
+        }),
+      readHistoryAfter: ({ nativeTurnId }) =>
+        Effect.gen(function* () {
+          reads.push(nativeTurnId);
+          if (nativeTurnId !== "imported-turn") return [];
+          yield* Deferred.succeed(historyRead, undefined);
+          yield* Deferred.await(releaseRead);
+          return [
+            {
+              id: "native-new-turn",
+              status: "completed" as const,
+              startedAt: externalTime,
+              completedAt: externalTime,
+              messages: [
+                { role: "user" as const, text: "From native Codex" },
+                { role: "assistant" as const, text: "New reply" },
+              ],
+            },
+          ];
+        }),
+    } satisfies Pick<
+      ProviderAdapter.ProviderAdapterV2SessionRuntime,
+      "readHistoryAfter" | "resolveImportedHistoryAnchor"
+    >;
+    const adapter = {
+      openSession: () => Effect.succeed(session),
+    } as unknown as ProviderAdapter.ProviderAdapterV2["Service"];
+    const importer = yield* makeImporter(
+      [{ ...source, thread: { ...source.thread, omittedMessageCount: 50 } }],
+      Effect.void,
+      () => Effect.succeed(adapter),
+      lock,
+    );
+    yield* importer.run;
+
+    const refresh = importer.refreshCodexHistory({ threadId });
+    const inFlight = yield* Effect.forkChild(refresh);
+    yield* Deferred.await(historyRead);
+    expect(yield* refresh).toBe(0);
+    yield* lock.withLock(threadId, Deferred.succeed(releaseRead, undefined));
+    expect(yield* Fiber.join(inFlight)).toBe(1);
+    expect(yield* refresh).toBe(0);
+    expect(boundaries).toEqual([{ text: "Fixed", createdAt: timestamp }]);
+    expect(reads).toEqual(["imported-turn", "native-new-turn"]);
+
+    const { messages, turnItems } = yield* projections.getThreadRecords(threadId, [
+      "messages",
+      "turnItems",
+    ]);
+    expect(
+      turnItems.flatMap((item) =>
+        item.type === "user_message" || item.type === "assistant_message" ? [item.text] : [],
+      ),
+    ).toEqual(["Fix it", "Fixed", "From native Codex", "New reply"]);
+    expect(messages.find((message) => message.text === "New reply")?.createdAt).toEqual(
+      externalTime,
+    );
+  }).pipe(Effect.provide(persistence), Effect.scoped),
+);
+
 it.effect("refreshes completed Codex turns in order, including gaps after a failed read", () =>
   Effect.gen(function* () {
     const sink = yield* EventSink.EventSinkV2;
