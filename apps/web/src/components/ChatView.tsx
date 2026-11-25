@@ -4302,9 +4302,16 @@ export default function ChatView(props: ChatViewProps) {
       <ThreadVisitWatermark
         threadRef={routeThreadRef}
         canRefreshCodexHistory={
-          activeProviderThread?.driver === "codex" &&
-          activeProviderThread.nativeThreadRef?.strength === "strong" &&
-          activeThread?.archivedAt == null
+          activeThread != null &&
+          activeThread.archivedAt == null &&
+          (activeProviderThread === undefined
+            ? providerStatuses.some(
+                (provider) =>
+                  provider.instanceId === activeThread.modelSelection.instanceId &&
+                  provider.driver === "codex",
+              )
+            : activeProviderThread.driver === "codex" &&
+              activeProviderThread.nativeThreadRef?.strength === "strong")
         }
       />
       <ExpandedImageDialogHost threadKey={routeThreadKey} />
