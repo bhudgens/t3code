@@ -57,14 +57,12 @@ export function ThreadVisitWatermark({
   useEffect(() => {
     if (!canRefreshCodexHistory) return;
     const refresh = () => {
-      if (document.visibilityState === "visible") {
-        void runAtomCommand(
-          appAtomRegistry,
-          refreshCodexHistory,
-          { environmentId, input: { threadId } },
-          { reportFailure: false },
-        );
-      }
+      void runAtomCommand(
+        appAtomRegistry,
+        refreshCodexHistory,
+        { environmentId, input: { threadId } },
+        { reportFailure: false },
+      );
     };
     refresh();
     return subscribeDocumentReturn(refresh);
