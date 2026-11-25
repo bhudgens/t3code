@@ -700,6 +700,10 @@ it.effect("refreshes a capped Codex import and moves to native turn IDs without 
       lock,
     );
     yield* importer.run;
+    const { projection } = yield* projections.getThreadSnapshotWindow(threadId, { rowLimit: 1 });
+    expect(projection.providerThreads).toEqual([
+      expect.objectContaining({ id: projection.thread.activeProviderThreadId, status: "idle" }),
+    ]);
 
     const refresh = importer.refreshCodexHistory({ threadId });
     const inFlight = yield* Effect.forkChild(refresh);
