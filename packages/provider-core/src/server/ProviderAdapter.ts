@@ -875,6 +875,12 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly readThreadSnapshot: (
     input: ProviderAdapterV2ReadThreadSnapshotInput,
   ) => Effect.Effect<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error>;
+  /** Resolve an imported transcript boundary that has no saved native turn ID. */
+  readonly resolveImportedHistoryAnchor?: (
+    input: ProviderAdapterV2ReadThreadSnapshotInput & {
+      readonly boundary: { readonly text: string; readonly createdAt: string };
+    },
+  ) => Effect.Effect<string | null, ProviderAdapterV2Error>;
   /** Native turns after a known turn, oldest first. If the anchor is missing, returns no turns. */
   readonly readHistoryAfter?: (
     input: ProviderAdapterV2ReadThreadSnapshotInput & {

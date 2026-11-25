@@ -1,6 +1,7 @@
 import { pipe } from "effect/Function";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { brokenRuntimeError } from "../../provider/providerCompatibility.ts";
+import { findCodexImportedHistoryAnchor } from "../../provider/CodexImportedHistoryAnchor.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -1249,6 +1250,8 @@ export const resolveCodexForkBoundary = Effect.fn("CodexAdapterV2.resolveForkBou
 /** Generated thread/read schemas omit historyMode; probe through the raw request channel. */
 const CodexThreadHistoryMetadata = Schema.Struct({
   thread: Schema.Struct({
+    id: Schema.optionalKey(Schema.String),
+    path: Schema.optionalKey(Schema.NullOr(Schema.String)),
     historyMode: Schema.optionalKey(Schema.Literals(["legacy", "paginated"])),
     status: Schema.optionalKey(Schema.Struct({ type: Schema.String })),
   }),
@@ -1297,6 +1300,7 @@ const readCodexThreadHistoryMetadata = Effect.fn("CodexAdapterV2.readThreadHisto
     return {
       historyMode: metadata.thread.historyMode,
       loaded: metadata.thread.status?.type !== "notLoaded",
+      path: metadata.thread.id === threadId ? metadata.thread.path : undefined,
     };
   },
 );
@@ -9243,6 +9247,35 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
           ),
           mcpApps,
+          resolveImportedHistoryAnchor: Effect.fn("CodexAdapterV2.resolveImportedHistoryAnchor")(
+            function* ({ providerThread, boundary }) {
+              const threadId = yield* getNativeThreadId(providerThread);
+              yield* ensureInitialized;
+              const { path } = yield* readCodexThreadHistoryMetadata(client.raw, threadId);
+              if (path == null) return null;
+              return yield* Effect.tryPromise({
+                try: (signal) => findCodexImportedHistoryAnchor(path, threadId, boundary, signal),
+                catch: (cause) =>
+                  new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
+                    driver: CODEX_PROVIDER,
+                    providerThreadId: providerThread.id,
+                    cause,
+                  }),
+              });
+            },
+            (effect, { providerThread }) =>
+              effect.pipe(
+                Effect.mapError((cause) =>
+                  cause._tag === "ProviderAdapterReadThreadSnapshotError"
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
+                        driver: CODEX_PROVIDER,
+                        providerThreadId: providerThread.id,
+                        cause,
+                      }),
+                ),
+              ),
+          ),
           readHistoryAfter: Effect.fn("CodexAdapterV2.readHistoryAfter")(
             function* ({ providerThread, nativeTurnId, knownNativeTurnIds }) {
               const threadId = yield* getNativeThreadId(providerThread);
