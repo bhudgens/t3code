@@ -2,6 +2,7 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeZlib from "node:zlib";
 import { expect, it } from "vite-plus/test";
 
 import { findCodexImportedHistoryAnchor } from "./CodexImportedHistoryAnchor.ts";
@@ -58,6 +59,53 @@ it.each([
       expected,
     );
     expect(await findCodexImportedHistoryAnchor(path, "wrong-thread", boundary, signal)).toBeNull();
+  } finally {
+    await NodeFSP.rm(dir, { recursive: true });
+  }
+});
+
+it("follows a compressed history prefix without reading the discarded suffix", async () => {
+  const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "codex-import-lineage-"));
+  try {
+    const parent = "01a1172e-b8ac-7bd1-bf3d-19075d5f750e";
+    const parentDir = NodePath.join(dir, "sessions", "2026", "10", "07");
+    const headDir = NodePath.join(dir, "sessions", "2026", "10", "29");
+    await NodeFSP.mkdir(parentDir, { recursive: true });
+    await NodeFSP.mkdir(headDir, { recursive: true });
+    const encode = (records: readonly unknown[]) =>
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n";
+    const retained = encode([session, context, assistant, completed]);
+    await NodeFSP.writeFile(
+      NodePath.join(parentDir, `rollout-2026-10-07T01-23-45_${parent}.jsonl.zst`),
+      NodeZlib.zstdCompressSync(Buffer.from(retained + encode([context, assistant, completed]))),
+    );
+    const head = NodePath.join(headDir, "rollout-2026-10-29T01-23-45.jsonl");
+    const signal = new AbortController().signal;
+    const writeHead = (prefix: string) =>
+      NodeFSP.writeFile(
+        head,
+        encode([
+          {
+            ...session,
+            payload: {
+              ...session.payload,
+              history_base: {
+                thread_id: parent,
+                end_byte_offset: Buffer.byteLength(prefix),
+              },
+            },
+          },
+        ]),
+      );
+
+    await writeHead(retained);
+    expect(await findCodexImportedHistoryAnchor(head, "native-thread", boundary, signal)).toBe(
+      "native-turn",
+    );
+    await writeHead(encode([session, context]));
+    expect(
+      await findCodexImportedHistoryAnchor(head, "native-thread", boundary, signal),
+    ).toBeNull();
   } finally {
     await NodeFSP.rm(dir, { recursive: true });
   }
