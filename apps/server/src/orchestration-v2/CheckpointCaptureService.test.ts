@@ -78,13 +78,15 @@ const modelSelection = {
 } as const;
 
 it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
-  it.effect.each([false, true])(
-    "captures without decoding history or losing newer delegated completion, ref lookup fails=%s",
-    (refLookupFails) =>
+  it.effect.each(["first run", "ref lookup fails", "shifted predecessor"] as const)(
+    "captures without decoding history or losing newer delegated completion (%s)",
+    (scenario) =>
       Effect.gen(function* () {
         const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
         const now = yield* DateTime.now;
         const later = DateTime.add(now, { seconds: 1 });
+        const refLookupFails = scenario === "ref lookup fails";
+        const shifted = scenario === "shifted predecessor";
 
         const staleDelegatedCompletion = {
           disposition: "open" as const,
@@ -103,7 +105,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         const staleRun: OrchestrationV2Run = {
           id: runId,
           threadId,
-          ordinal: 1,
+          ordinal: shifted ? 4 : 1,
           providerInstanceId,
           modelSelection,
           providerThreadId,
@@ -193,6 +195,15 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           files: [],
           capturedAt: now,
         };
+        const previousCheckpoint = {
+          ...readyBaseline,
+          id: CheckpointId.make("checkpoint:previous-run"),
+          ref: CheckpointRef.make("checkpoint-ref:previous-run"),
+          runId: RunId.make("run:previous-after-history-refresh"),
+          parentCheckpointId: readyBaseline.id,
+          appRunOrdinal: 3,
+          ordinalWithinScope: 2,
+        };
 
         yield* projectionStore.apply({
           id: EventId.make("event:checkpoint-capture:thread"),
@@ -276,6 +287,15 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           occurredAt: now,
           payload: readyBaseline,
         });
+        if (shifted) {
+          yield* projectionStore.apply({
+            id: EventId.make("event:checkpoint-capture:previous-run"),
+            type: "checkpoint.captured",
+            threadId,
+            occurredAt: now,
+            payload: previousCheckpoint,
+          });
+        }
         const sql = yield* SqlClient.SqlClient;
         yield* sql`INSERT OR REPLACE INTO orchestration_v2_projection_turn_items
           (turn_item_id, thread_id, run_id, node_id, provider_thread_id, provider_turn_id,
@@ -291,11 +311,12 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         );
 
         const committed = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
+        const captureBases: Array<CheckpointRef | undefined> = [];
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
               IdAllocator.layer,
-              refLookupFails
+              refLookupFails || shifted
                 ? CheckpointService.layer.pipe(
                     Layer.provide(
                       Layer.mergeAll(
@@ -305,16 +326,23 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                         Layer.mock(CheckpointStore.CheckpointStore)({
                           listAuthoredPaths: () => Effect.succeed(null),
                           isGitRepository: () => Effect.succeed(true),
-                          captureCheckpoint: () => Effect.succeed(null),
+                          captureCheckpoint: ({ previousCheckpointRef }) =>
+                            Effect.sync(() => {
+                              captureBases.push(previousCheckpointRef);
+                              return null;
+                            }),
+                          diffCheckpoints: () => Effect.succeed(""),
                           hasCheckpointRef: () =>
-                            Effect.fail(
-                              new VcsProcessTimeoutError({
-                                operation: "test.hasCheckpointRef",
-                                command: "git",
-                                cwd: "/repo",
-                                timeoutMs: 30000,
-                              }),
-                            ),
+                            refLookupFails
+                              ? Effect.fail(
+                                  new VcsProcessTimeoutError({
+                                    operation: "test.hasCheckpointRef",
+                                    command: "git",
+                                    cwd: "/repo",
+                                    timeoutMs: 30000,
+                                  }),
+                                )
+                              : Effect.succeed(true),
                         }),
                       ),
                     ),
@@ -362,14 +390,21 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           assert.equal(runUpdated.payload.status, "completed");
           assert.deepEqual(runUpdated.payload.completedAt, now);
           assert.isFalse(events.some((event) => event.type === "node.updated"));
-          const capturedEvent = events.find((event) => event.type === "checkpoint.captured");
+          const capturedEvent = events
+            .filter((event) => event.type === "checkpoint.captured")
+            .find((event) => event.payload.runId === runId);
           assert.equal(
             runUpdated.payload.checkpointId,
-            refLookupFails ? capturedEvent?.payload.id : captured.id,
+            refLookupFails || shifted ? capturedEvent?.payload.id : captured.id,
           );
           if (refLookupFails && capturedEvent?.type === "checkpoint.captured") {
             assert.equal(capturedEvent.payload.status, "ready");
             assert.deepEqual(capturedEvent.payload.files, []);
+          }
+          if (shifted) {
+            assert.equal(capturedEvent?.payload.parentCheckpointId, previousCheckpoint.id);
+            assert.equal(capturedEvent?.payload.ordinalWithinScope, 4);
+            assert.deepEqual(captureBases, [previousCheckpoint.ref]);
           }
           assert.isUndefined(
             runUpdated.payload.delegatedCompletion,
